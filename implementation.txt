@@ -1,0 +1,353 @@
+# Login Handling Implementation
+
+## 1. Login Detection System
+
+```python
+class LoginDetector:
+    def __init__(self):
+        self.login_indicators = {
+            'forms': ['login', 'signin', 'sign-in'],
+            'urls': ['/login', '/signin', '/auth'],
+            'elements': [
+                '[type="password"]',
+                'form[action*="login"]',
+                'form[action*="signin"]'
+            ],
+            'text': ['login required', 'please sign in', 'authentication required']
+        }
+        
+    async def detect_login_requirement(self, page: 'WebPage') -> Dict:
+        """Detect if page requires login and identify login method."""
+        return {
+            'requires_login': bool,
+            'login_type': 'form|oauth|basic_auth',
+            'login_url': str,
+            'form_data': Dict
+        }
+```
+
+## 2. Credential Management
+
+```python
+class CredentialManager:
+    def __init__(self):
+        self.keyring = SystemKeyring()
+        self.session_tokens = {}
+        
+    async def get_credentials(self, domain: str) -> Optional[Dict]:
+        """Securely retrieve stored credentials."""
+        return {
+            'username': str,
+            'password': str,
+            'tokens': Dict,
+            'cookies': Dict
+        }
+        
+    async def store_credentials(self, domain: str, credentials: Dict):
+        """Securely store credentials with encryption."""
+        pass
+        
+    async def clear_credentials(self, domain: str):
+        """Remove stored credentials."""
+        pass
+```
+
+## 3. User Interaction Handler
+
+```python
+class UserInteractionHandler:
+    def __init__(self, browser_window: 'BrowserWindow'):
+        self.window = browser_window
+        self.pending_responses = {}
+
+    async def request_credentials(self, domain: str, login_type: str) -> Dict:
+        """Request login credentials from user via UI."""
+        message = {
+            'type': 'login_required',
+            'domain': domain,
+            'login_type': login_type,
+            'message': f"🔐 Login required for {domain}",
+            'options': {
+                'save_credentials': True,
+                'remember_session': True
+            }
+        }
+        
+        # Show login dialog in browser view
+        self.window.show_login_dialog(message)
+        
+        # Wait for user input
+        credentials = await self.window.wait_for_login_input()
+        
+        if not credentials:
+            logger.warning(f"User cancelled login for {domain}")
+            return None
+            
+        return credentials
+
+    async def handle_2fa_request(self, domain: str, method: str) -> str:
+        """Handle 2FA code request."""
+        message = {
+            'type': '2fa_required',
+            'domain': domain,
+            'method': method,
+            'message': f"🔒 Two-factor authentication required for {domain}"
+        }
+        
+        self.window.show_2fa_dialog(message)
+        return await self.window.wait_for_2fa_input()
+```
+
+## 4. Browser Window UI Components
+
+```python
+class BrowserWindow(QMainWindow):
+    def show_login_dialog(self, message: Dict):
+        """Display login dialog in browser view."""
+        html = f"""
+        <div class="login-overlay">
+            <div class="login-box">
+                <h3>{message['message']}</h3>
+                <form id="login-form">
+                    <input type="text" placeholder="Username" id="username"/>
+                    <input type="password" placeholder="Password" id="password"/>
+                    <div class="options">
+                        <label>
+                            <input type="checkbox" id="save_credentials"/>
+                            Save credentials securely
+                        </label>
+                        <label>
+                            <input type="checkbox" id="remember_session"/>
+                            Remember this session
+                        </label>
+                    </div>
+                    <div class="buttons">
+                        <button type="submit">Login</button>
+                        <button type="button" onclick="cancelLogin()">Cancel</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+        """
+        self.browser_view.inject_html(html)
+        
+    def show_2fa_dialog(self, message: Dict):
+        """Display 2FA input dialog."""
+        html = f"""
+        <div class="2fa-overlay">
+            <div class="2fa-box">
+                <h3>{message['message']}</h3>
+                <p>Please enter the verification code:</p>
+                <input type="text" id="2fa_code" maxlength="6"/>
+                <div class="buttons">
+                    <button onclick="submit2FA()">Verify</button>
+                    <button onclick="cancel2FA()">Cancel</button>
+                </div>
+            </div>
+        </div>
+        """
+        self.browser_view.inject_html(html)
+```
+
+## 5. Updated Login Handler
+
+```python
+class LoginHandler:
+    def __init__(self, browser_window: 'BrowserWindow'):
+        self.detector = LoginDetector()
+        self.credential_manager = CredentialManager()
+        self.user_interaction = UserInteractionHandler(browser_window)
+        
+    async def handle_login(self, page: 'WebPage') -> bool:
+        """Main login handling flow with user interaction."""
+        # 1. Detect login requirement
+        login_info = await self.detector.detect_login_requirement(page)
+        if not login_info['requires_login']:
+            return True
+            
+        domain = page.url().host()
+        
+        # 2. Try stored credentials first
+        credentials = await self.credential_manager.get_credentials(domain)
+        
+        # 3. If no stored credentials, request from user
+        if not credentials:
+            logger.info(f"🔐 Reasoning: Login required for {domain}, requesting credentials")
+            credentials = await self.user_interaction.request_credentials(
+                domain,
+                login_info['login_type']
+            )
+            
+            if not credentials:
+                logger.warning("❌ Execution: User cancelled login")
+                return False
+                
+            # Store if user opted to save
+            if credentials.get('save_credentials'):
+                await self.credential_manager.store_credentials(domain, credentials)
+        
+        # 4. Attempt login
+        success = await self._execute_login(page, login_info, credentials)
+        
+        # 5. Handle 2FA if needed
+        if success and await self._requires_2fa(page):
+            logger.info("🔒 Reasoning: Two-factor authentication required")
+            code = await self.user_interaction.handle_2fa_request(
+                domain,
+                self._detect_2fa_method(page)
+            )
+            if code:
+                success = await self._handle_2fa(page, code)
+            else:
+                success = False
+        
+        return success
+```
+
+## 6. Integration with Browser Tools
+
+```python
+class BrowserTools:
+    def __init__(self, browser_window: 'BrowserWindow'):
+        self.login_handler = LoginHandler(browser_window)
+        
+    async def visit_url(self, url: str):
+        """Handle login during navigation with user interaction."""
+        await super().visit_url(url)
+        
+        if await self.login_handler.handle_login(self.page):
+            logger.info("✅ Execution: Successfully logged in")
+        else:
+            logger.warning("⚠️ Execution: Could not complete login")
+```
+
+## 7. CSS Styling for Login UI
+
+```css
+.login-overlay, .2fa-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0, 0, 0, 0.7);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    z-index: 9999;
+}
+
+.login-box, .2fa-box {
+    background: #fff;
+    padding: 20px;
+    border-radius: 8px;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+    width: 300px;
+}
+
+.login-box input, .2fa-box input {
+    width: 100%;
+    padding: 8px;
+    margin: 8px 0;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+}
+
+.options {
+    margin: 15px 0;
+}
+
+.buttons {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 15px;
+}
+
+button {
+    padding: 8px 16px;
+    border-radius: 4px;
+    border: none;
+    cursor: pointer;
+}
+
+button[type="submit"] {
+    background: #4CAF50;
+    color: white;
+}
+
+button[onclick*="cancel"] {
+    background: #f44336;
+    color: white;
+}
+```
+
+## 8. Implementation Notes
+
+1. User Experience:
+   - Non-blocking UI overlays
+   - Clear visual feedback
+   - Secure input handling
+   - Remember me option
+   - Save credentials option
+
+2. Security:
+   - Credentials input in secure fields
+   - Clear credentials after use
+   - Secure storage if requested
+   - Session management
+
+3. Error Handling:
+   - Invalid credentials feedback
+   - Network issues
+   - Timeout handling
+   - Retry options
+
+4. Integration:
+   - Seamless UI integration
+   - Non-blocking operation
+   - Event-driven architecture
+   - State management
+
+## 9. Implementation Steps
+
+1. Core Components:
+   - Implement LoginDetector
+   - Implement CredentialManager
+   - Implement LoginHandler
+
+2. Security Layer:
+   - Set up encryption
+   - Configure keyring
+   - Implement token management
+
+3. Integration:
+   - Add to BrowserTools
+   - Update NavigationPlanner
+   - Add error recovery
+
+4. Testing:
+   - Unit tests for each component
+   - Integration tests
+   - Security testing
+
+## 7. Advanced Features
+
+1. Multi-Factor Authentication:
+   - SMS code handling
+   - Authenticator app integration
+   - Backup code support
+
+2. SSO Support:
+   - OAuth 2.0 flows
+   - SAML integration
+   - JWT handling
+
+3. Rate Limiting:
+   - Exponential backoff
+   - Request queuing
+   - IP rotation support
+
+4. Session Management:
+   - Cookie management
+   - Token refresh
+   - Session pooling 

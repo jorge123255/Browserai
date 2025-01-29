@@ -5,6 +5,7 @@ from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 from PyQt5.QtCore import Qt, pyqtSignal, QUrl, QPropertyAnimation, QEasingCurve, QRect
 from PyQt5.QtGui import QFont, QPalette, QColor, QPainter, QPainterPath
+from typing import List
 
 # Dark theme colors with more vibrant accents
 COLORS = {
@@ -519,53 +520,116 @@ class BrowserWindow(QMainWindow):
         """Clear the reasoning output"""
         self.reasoning_output.clear()
         
-    def add_reasoning(self, step: str, content: str, type: str = 'info'):
-        """Add a reasoning step with custom styling based on type"""
-        from datetime import datetime
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        
-        # Style based on type
-        if type == 'success':
-            color = COLORS['secondary']
-            bg_color = COLORS['success_bg']
-        elif type == 'warning':
-            color = '#fbbf24'
-            bg_color = COLORS['warning_bg']
-        elif type == 'error':
-            color = COLORS['error']
-            bg_color = '#7f1d1d'
-        else:  # info
-            color = COLORS['primary']
-            bg_color = COLORS['info_bg']
-            
-        # Format the message with custom styling
-        formatted_msg = f"""
-            <div style='
-                background-color: {bg_color};
-                padding: 10px;
-                border-radius: 8px;
-                margin-bottom: 10px;
-            '>
-                <div style='
-                    color: {color};
-                    font-weight: bold;
-                    margin-bottom: 5px;
-                '>
-                    [{timestamp}] {step}
-                </div>
-                <div style='
-                    color: {COLORS["text"]};
-                    white-space: pre-wrap;
-                '>
-                    {content}
-                </div>
+    def add_reasoning(self, title: str, message: str, details: List[str] = None):
+        """Add reasoning information to the UI."""
+        html = f"""
+        <div class="reasoning-block">
+            <div class="reasoning-header">
+                <span class="title">{title}</span>
             </div>
+            <div class="reasoning-content">
+                <p class="message">{message}</p>
+                {self._format_details(details) if details else ''}
+            </div>
+        </div>
+        """
+        self.reasoning_output.append(html)
+        self._scroll_to_bottom(self.reasoning_output)
+        
+    def add_execution(self, message: str, status: str = "info"):
+        """Add execution step to the UI."""
+        icons = {
+            "info": "ℹ️",
+            "success": "✅",
+            "warning": "⚠️",
+            "error": "❌",
+            "step": "👉",
+            "action": "🔄"
+        }
+        
+        colors = {
+            "info": "#569CD6",    # Blue
+            "success": "#4EC9B0", # Green
+            "warning": "#CE9178", # Orange
+            "error": "#F44747",   # Red
+            "step": "#DCDCAA",    # Yellow
+            "action": "#C586C0"   # Purple
+        }
+        
+        html = f"""
+        <div class="execution-step" style="color: {colors.get(status, colors['info'])}">
+            <span class="icon">{icons.get(status, icons['info'])}</span>
+            <span class="message">{message}</span>
+        </div>
+        """
+        self.execution_output.append(html)
+        self._scroll_to_bottom(self.execution_output)
+        
+    def _format_details(self, details: List[str]) -> str:
+        """Format details list as HTML."""
+        if not details:
+            return ""
+            
+        items = "\n".join([f"<li>{detail}</li>" for detail in details])
+        return f"""
+        <ul class="details-list">
+            {items}
+        </ul>
         """
         
-        # Add to reasoning output
-        self.reasoning_output.append(formatted_msg)
-        scrollbar = self.reasoning_output.verticalScrollBar()
+    def _scroll_to_bottom(self, widget: QWidget):
+        """Scroll widget to bottom."""
+        scrollbar = widget.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
+        
+    def _setup_styles(self):
+        """Setup CSS styles for the UI components."""
+        self.setStyleSheet("""
+            .reasoning-block {
+                background-color: #2D2D2D;
+                border-radius: 4px;
+                margin: 8px 0;
+                padding: 12px;
+            }
+            
+            .reasoning-header {
+                color: #569CD6;
+                font-size: 14px;
+                font-weight: bold;
+                margin-bottom: 8px;
+            }
+            
+            .reasoning-content {
+                color: #D4D4D4;
+                margin-left: 8px;
+            }
+            
+            .message {
+                margin: 4px 0;
+            }
+            
+            .details-list {
+                margin: 4px 0 4px 20px;
+                padding: 0;
+            }
+            
+            .details-list li {
+                margin: 2px 0;
+                color: #9CDCFE;
+            }
+            
+            .execution-step {
+                background-color: #2D2D2D;
+                border-left: 4px solid;
+                margin: 4px 0;
+                padding: 6px 10px;
+                font-family: "Menlo", "Monaco", "Courier New", monospace;
+            }
+            
+            .icon {
+                margin-right: 8px;
+            }
+        """)
 
 #A PyQt main window with:
 #	•	A browser view (QWebEngineView).

@@ -1,6 +1,6 @@
 from typing import Optional, Dict, Any, List
 from PyQt5.QtWebEngineWidgets import QWebEnginePage, QWebEngineProfile, QWebEngineSettings, QWebEngineView
-from PyQt5.QtCore import QEventLoop, QUrl, QTimer, QSize, QBuffer
+from PyQt5.QtCore import QEventLoop, QUrl, QTimer, QSize, QBuffer, pyqtSlot
 from PyQt5.QtGui import QImage, QPixmap
 from bs4 import BeautifulSoup
 import json
@@ -11,43 +11,61 @@ from urllib.parse import urlparse
 import os
 from datetime import datetime
 import torch
+from core.enhancements import BrowserEnhancements
+from transformers import DetrForObjectDetection, DetrImageProcessor
 
 class BrowserTools:
     """Main browser automation class with LLM integration"""
     
-    def __init__(self, page: QWebEnginePage):
-        """Initialize browser tools with an existing page from the view."""
-        self.page = page  # Use the provided page instead of creating new one
-        self.view = self.page.view()  # Get the associated view
+    def __init__(self, view_or_page):
+        """Initialize browser automation with enhanced capabilities.
+        Args:
+            view_or_page: Either QWebEngineView or QWebEnginePage
+        """
+        if isinstance(view_or_page, QWebEnginePage):
+            self.page = view_or_page
+            self.view = self.page.view()
+        else:  # QWebEngineView
+            self.view = view_or_page
+            self.page = self.view.page() if self.view else None
+            
         self.recording = False
         self.screenshots = []
-        self.recording_path = "recordings"
         self.current_session = None
+        self.recording_path = "recordings"
         self.vision_enabled = False
+        self._reasoning_history = []
+        self._execution_history = []
         
+        # Initialize vision models
         try:
-            # Initialize vision models
-            import timm
-            from transformers import AutoProcessor, AutoModelForObjectDetection
-            
-            # Initialize DETR model for object detection
-            self.processor = AutoProcessor.from_pretrained("facebook/detr-resnet-50")
-            self.model = AutoModelForObjectDetection.from_pretrained("facebook/detr-resnet-50")
-            
-            # Initialize image feature extractor
-            self.feature_extractor = timm.create_model('resnet50', pretrained=True, num_classes=0)
-            self.feature_extractor.eval()
-            
+            self.vision_model = DetrForObjectDetection.from_pretrained("facebook/detr-resnet-50")
+            self.processor = DetrImageProcessor.from_pretrained("facebook/detr-resnet-50")
             self.vision_enabled = True
             logger.info("Vision models initialized successfully")
         except Exception as e:
-            logger.warning(f"Vision models not available: {str(e)}")
-            logger.info("Continuing without vision support")
+            logger.error(f"Error initializing vision models: {str(e)}")
+            self.vision_model = None
+            self.processor = None
         
-        # Create recordings directory if it doesn't exist
-        if not os.path.exists(self.recording_path):
-            os.makedirs(self.recording_path)
+        # Initialize LLM connection
+        self.llm = OllamaConnection(browser_window=self.view)
         
+        # Initialize enhancements
+        self.enhancements = BrowserEnhancements(browser_window=self.view)
+        
+        # Configure page settings
+        if self.page:
+            self._configure_page()
+            self._setup_handlers()
+            
+        logger.info("Initialized enhanced browser automation")
+        
+    def _configure_page(self):
+        """Configure page settings for automation."""
+        if not self.page:
+            return
+            
         # Configure page settings
         settings = self.page.settings()
         settings.setAttribute(QWebEngineSettings.JavascriptEnabled, True)
@@ -64,9 +82,127 @@ class BrowserTools:
         profile.setPersistentCookiesPolicy(QWebEngineProfile.NoPersistentCookies)
         profile.setHttpCacheType(QWebEngineProfile.MemoryHttpCache)
         
-        self.llm = OllamaConnection()
-        logger.info("Initialized enhanced browser automation")
+        # Initialize UI containers with styles
+        script = """
+        function initUI() {
+            // Create containers if they don't exist
+            ['agent-reasoning', 'execution-log'].forEach(id => {
+                if (!document.getElementById(id)) {
+                    const div = document.createElement('div');
+                    div.id = id;
+                    div.className = id === 'agent-reasoning' ? 'reasoning-log' : 'execution-log';
+                    document.body.appendChild(div);
+                }
+            });
+
+            // Add styles if not already present
+            if (!document.getElementById('browser-tools-styles')) {
+                const style = document.createElement('style');
+                style.id = 'browser-tools-styles';
+                style.textContent = `
+                    .reasoning-log {
+                        position: fixed;
+                        top: 20px;
+                        right: 20px;
+                        max-width: 400px;
+                        max-height: 80vh;
+                        overflow-y: auto;
+                        background: rgba(0, 0, 0, 0.8);
+                        color: white;
+                        padding: 15px;
+                        border-radius: 8px;
+                        font-family: system-ui;
+                        z-index: 10000;
+                    }
+                    .execution-log {
+                        position: fixed;
+                        bottom: 20px;
+                        right: 20px;
+                        max-width: 400px;
+                        max-height: 30vh;
+                        overflow-y: auto;
+                        background: rgba(0, 0, 0, 0.8);
+                        color: white;
+                        padding: 15px;
+                        border-radius: 8px;
+                        font-family: system-ui;
+                        z-index: 10000;
+                    }
+                    .log-entry {
+                        margin-bottom: 10px;
+                        padding: 8px;
+                        background: rgba(255, 255, 255, 0.1);
+                        border-radius: 4px;
+                    }
+                    .log-title {
+                        font-weight: bold;
+                        margin-bottom: 5px;
+                    }
+                    .log-details {
+                        font-size: 0.9em;
+                        opacity: 0.9;
+                    }
+                    .timestamp {
+                        font-size: 0.8em;
+                        opacity: 0.7;
+                    }
+                `;
+                document.head.appendChild(style);
+            }
+        }
+        initUI();
+        """
+        self.page.runJavaScript(script)
         
+    def _setup_handlers(self):
+        """Setup page event handlers."""
+        if not self.page:
+            return
+            
+        # Create recordings directory if it doesn't exist
+        if not os.path.exists(self.recording_path):
+            os.makedirs(self.recording_path)
+            
+        # Setup JavaScript event handlers
+        self.page.loadFinished.connect(lambda ok: asyncio.create_task(self._on_load_finished(ok)))
+        self.page.loadStarted.connect(lambda: asyncio.create_task(self._on_load_started()))
+        
+    @pyqtSlot()
+    async def _on_load_started(self):
+        """Handle page load start event."""
+        if self.recording:
+            await self._take_screenshot()
+            
+    @pyqtSlot(bool)
+    async def _on_load_finished(self, ok: bool):
+        """Handle page load finished event."""
+        if not ok:
+            logger.error("Page failed to load")
+            return
+            
+        if self.recording:
+            await self._take_screenshot()
+            
+        # Setup page monitoring
+        await self._handle_page_events()
+        
+        # Re-initialize UI containers and styles
+        script = """
+        function initUI() {
+            // Create containers if they don't exist
+            ['agent-reasoning', 'execution-log'].forEach(id => {
+                if (!document.getElementById(id)) {
+                    const div = document.createElement('div');
+                    div.id = id;
+                    div.className = id === 'agent-reasoning' ? 'reasoning-log' : 'execution-log';
+                    document.body.appendChild(div);
+                }
+            });
+        }
+        initUI();
+        """
+        self.page.runJavaScript(script)
+
     async def start_recording(self):
         """Start recording browser interactions"""
         self.recording = True
@@ -99,42 +235,80 @@ class BrowserTools:
             self.current_session = None
 
     def _schedule_screenshot(self):
-        """Schedule the next screenshot"""
-        if self.recording:
-            # Create task in event loop instead of using QTimer
-            loop = asyncio.get_event_loop()
-            loop.create_task(self._delayed_screenshot())
-    
-    async def _delayed_screenshot(self):
-        """Wait and take screenshot"""
-        await asyncio.sleep(0.5)  # 500ms delay
-        await self._take_screenshot()
-
-    async def _take_screenshot(self):
-        """Capture current browser view"""
-        if not self.recording or not self.view:
+        """Schedule periodic screenshots."""
+        if not self.recording:
             return
             
         try:
-            # Use QWebEngineView's grab method
-            pixmap = self.view.grab()
-            if not pixmap.isNull():
-                # Convert QPixmap to QImage
-                image = pixmap.toImage()
+            # Create QTimer for periodic screenshots
+            if not hasattr(self, '_screenshot_timer'):
+                self._screenshot_timer = QTimer()
+                self._screenshot_timer.timeout.connect(
+                    lambda: asyncio.create_task(self._take_screenshot())
+                )
+            
+            # Start timer if not running
+            if not self._screenshot_timer.isActive():
+                self._screenshot_timer.start(2000)  # Screenshot every 2 seconds
                 
-                # Save screenshot
-                filename = f"screenshot_{len(self.screenshots):04d}.png"
-                session_dir = os.path.join(self.recording_path, self.current_session)
-                image.save(os.path.join(session_dir, filename))
-                self.screenshots.append(filename)
+        except Exception as e:
+            logger.error(f"Error scheduling screenshots: {str(e)}")
+            
+    def _stop_screenshot_timer(self):
+        """Stop the screenshot timer."""
+        if hasattr(self, '_screenshot_timer'):
+            self._screenshot_timer.stop()
+
+    async def _take_screenshot(self):
+        """Take a screenshot of the current page."""
+        try:
+            if not self.view or not self.recording:
+                return
                 
-            # Schedule next screenshot
-            self._schedule_screenshot()
+            # Ensure view is ready
+            if not self.view.isVisible():
+                logger.warning("View not visible, skipping screenshot")
+                return
+                
+            # Create QTimer for delayed capture
+            loop = asyncio.get_event_loop()
+            future = loop.create_future()
+            
+            def take_delayed_screenshot():
+                try:
+                    # Get viewport size
+                    size = self.view.size()
+                    if size.width() == 0 or size.height() == 0:
+                        logger.warning("Invalid view size, skipping screenshot")
+                        future.set_result(None)
+                        return
+                        
+                    # Create pixmap and render view
+                    pixmap = QPixmap(size)
+                    self.view.render(pixmap)
+                    
+                    # Save screenshot
+                    if self.current_session:
+                        timestamp = datetime.now().strftime("%H%M%S")
+                        filename = f"screenshot_{timestamp}.png"
+                        path = os.path.join(self.recording_path, self.current_session, filename)
+                        pixmap.save(path)
+                        self.screenshots.append(path)
+                        logger.debug(f"Saved screenshot: {path}")
+                    
+                    future.set_result(True)
+                except Exception as e:
+                    logger.error(f"Error taking screenshot: {str(e)}")
+                    future.set_exception(e)
+            
+            # Schedule screenshot with delay
+            QTimer.singleShot(100, take_delayed_screenshot)
+            
+            await future
             
         except Exception as e:
-            logger.error(f"Error taking screenshot: {str(e)}")
-            self._schedule_screenshot()
-
+            logger.error(f"Error in screenshot capture: {str(e)}")
+            
     async def execute_task(self, task: Dict[str, Any]) -> bool:
         """Execute a high-level task with recording"""
         try:
@@ -244,8 +418,11 @@ class BrowserTools:
             
             # Initial navigation if needed
             if url := task.get("url"):
-                if not await self._handle_navigation(url):
-                    return False
+                # Use enhanced navigation planning
+                nav_path = await self.enhancements.plan_navigation(url, goal, self.page)
+                for step_url in nav_path:
+                    if not await self._handle_navigation(step_url):
+                        return False
             
             # Main task execution loop
             max_steps = 10  # Prevent infinite loops
@@ -254,10 +431,18 @@ class BrowserTools:
                 page_state = await self.analyze_page_structure()
                 visual_state = await self._analyze_visual_elements()
                 
-                # Plan next action
+                # Process current page content
+                page_content = await self.get_visible_text()
+                processed_content = await self.enhancements.process_page_content(
+                    page_content,
+                    context={"goal": goal, "visual_state": visual_state}
+                )
+                
+                # Plan next action with enhanced context
                 action_plan = await self._plan_next_action(goal, {
                     **page_state,
-                    "visual_elements": visual_state
+                    "visual_elements": visual_state,
+                    "processed_content": processed_content
                 })
                 
                 if not action_plan:
@@ -287,13 +472,18 @@ class BrowserTools:
                     logger.error(f"Failed to execute action: {action_plan}")
                     return False
                 
-                # Check if goal is achieved
-                if await self._check_goal_completion(goal, page_state):
+                # Check if goal is achieved with enhanced validation
+                validated_state = await self.enhancements.validate_content(
+                    {"content": page_content, "state": page_state},
+                    base_url=self.page.url().toString()
+                )
+                
+                if await self._check_goal_completion(goal, {**page_state, "validated": validated_state}):
                     logger.info("Goal achieved successfully")
                     return True
                 
-                # Wait for page to stabilize
-                await self._wait_for_stable_page()
+                # Wait for page to stabilize with enhanced dynamic content handling
+                await self.enhancements.navigation_planner.handle_dynamic_content(self.page)
             
             logger.warning("Max steps reached without achieving goal")
             return False
@@ -350,8 +540,19 @@ class BrowserTools:
         response = await self.llm.generate_text(prompt_text)
         
         try:
-            result = json.loads(response)
-            return result.get("achieved", False) and result.get("confidence", 0) > 0.8
+            # Clean the response to ensure it's valid JSON
+            if response:
+                response = response.strip()
+                if "```" in response:
+                    response = response.split("```")[1]  # Get content between first pair of ```
+                    if response.startswith("json"):
+                        response = response[4:]  # Remove "json" language identifier
+                response = response.strip()
+                
+                result = json.loads(response)
+                return result.get("achieved", False) and result.get("confidence", 0) > 0.8
+            return False
+            
         except Exception as e:
             logger.error(f"Error checking goal completion: {str(e)}")
             return False
@@ -683,176 +884,62 @@ class BrowserTools:
             return None
 
     async def analyze_page_structure(self) -> Dict[str, Any]:
-        """Analyze the page structure to identify navigation elements and interactive components."""
-        script = """
-        (function() {
-            function getElementInfo(element) {
-                const rect = element.getBoundingClientRect();
-                const style = window.getComputedStyle(element);
-                return {
-                    tag: element.tagName.toLowerCase(),
-                    id: element.id,
-                    classes: Array.from(element.classList),
-                    text: element.textContent.trim(),
-                    href: element.href || '',
-                    role: element.getAttribute('role'),
-                    ariaLabel: element.getAttribute('aria-label'),
-                    visible: (
-                        rect.width > 0 &&
-                        rect.height > 0 &&
-                        style.display !== 'none' &&
-                        style.visibility !== 'hidden' &&
-                        style.opacity !== '0' &&
-                        element.offsetParent !== null
-                    ),
-                    location: {
-                        top: rect.top,
-                        left: rect.left,
-                        bottom: rect.bottom,
-                        right: rect.right
-                    }
-                };
-            }
-
-            function findNavigationElements() {
-                const navElements = [];
-                
-                // Find navigation sections
-                const navSelectors = [
-                    'nav',
-                    '[role="navigation"]',
-                    '.nav',
-                    '#nav',
-                    'header',
-                    '.header',
-                    '#header'
-                ];
-                
-                navSelectors.forEach(selector => {
-                    document.querySelectorAll(selector).forEach(nav => {
-                        const links = nav.querySelectorAll('a');
-                        links.forEach(link => {
-                            navElements.push(getElementInfo(link));
-                        });
-                    });
-                });
-                
-                return navElements;
-            }
-
-            function findInteractiveElements() {
-                const elements = [];
-                const selectors = [
-                    'button',
-                    'a[href]',
-                    'input',
-                    'select',
-                    'textarea',
-                    '[role="button"]',
-                    '[role="link"]',
-                    '[role="tab"]',
-                    '[role="menuitem"]',
-                    '[onclick]',
-                    '[class*="btn"]',
-                    '[class*="button"]'
-                ];
-                
-                selectors.forEach(selector => {
-                    document.querySelectorAll(selector).forEach(el => {
-                        if (el.offsetParent !== null) {  // Only visible elements
-                            elements.push(getElementInfo(el));
-                        }
-                    });
-                });
-                
-                return elements;
-            }
-
-            function findMainContent() {
-                const selectors = [
-                    'main',
-                    '[role="main"]',
-                    '#main',
-                    '.main',
-                    'article',
-                    '.content',
-                    '#content'
-                ];
-                
-                for (const selector of selectors) {
-                    const element = document.querySelector(selector);
-                    if (element) {
-                        return getElementInfo(element);
-                    }
-                }
-                
-                return null;
-            }
-
+        """Enhanced page structure analysis."""
+        try:
+            html = await self.get_visible_text()
+            processed = await self.enhancements.process_page_content(html)
+            
             return {
-                url: window.location.href,
-                title: document.title,
-                navigation: findNavigationElements(),
-                interactive: findInteractiveElements(),
-                mainContent: findMainContent()
-            };
-        })()
-        """
-        
-        result = await self._run_javascript(script)
-        return result if result else {}
+                "url": self.page.url().toString(),
+                "title": await self._run_javascript("return document.title;"),
+                "processed_content": processed,
+                "structure": {
+                    "sections": processed.get("sections", {}),
+                    "validated": processed.get("validated", {}),
+                    "comprehensive": processed.get("comprehensive", {})
+                }
+            }
+        except Exception as e:
+            logger.error(f"Error analyzing page structure: {str(e)}")
+            return {}
 
     async def find_best_element(self, goal: str, page_structure: Dict[str, Any]) -> Optional[str]:
-        """Find the best element to interact with based on the goal and page structure."""
+        """Find the best matching element for the given goal using enhanced analysis."""
         try:
-            # Prepare context for LLM
-            elements_context = []
+            # Use content processor to extract relevant sections
+            content = await self.get_visible_text()
+            processed = await self.enhancements.process_page_content(content)
             
-            # Add navigation elements
-            for elem in page_structure.get('navigation', []):
-                if elem.get('visible'):
-                    elements_context.append({
-                        'type': 'navigation',
-                        'text': elem.get('text', ''),
-                        'href': elem.get('href', ''),
-                        'aria_label': elem.get('ariaLabel', ''),
-                        'selector': self._generate_selector(elem)
-                    })
-            
-            # Add interactive elements
-            for elem in page_structure.get('interactive', []):
-                if elem.get('visible'):
-                    elements_context.append({
-                        'type': 'interactive',
-                        'text': elem.get('text', ''),
-                        'tag': elem.get('tag', ''),
-                        'role': elem.get('role', ''),
-                        'selector': self._generate_selector(elem)
-                    })
-
-            response = await self.llm.generate_text(self._create_element_prompt(goal, elements_context))
-            if not response:
+            # Analyze page structure with enhanced context
+            elements = page_structure.get('interactive', [])
+            if not elements:
                 return None
-                
-            # Clean up response to ensure valid JSON
-            response = response.strip()
-            if response.startswith('```json'):
-                response = response[7:]
-            if response.endswith('```'):
-                response = response[:-3]
-            response = response.strip()
             
-            try:
-                action = json.loads(response)
-                if action.get('confidence', 0) > 0.7:  # Only return if confidence is high
-                    return action
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse LLM response: {str(e)}")
-                logger.debug(f"Raw response: {response}")
-                return None
-                
+            # Score elements using result analyzer
+            scored_elements = []
+            for element in elements:
+                element_text = f"{element.get('text', '')} {element.get('ariaLabel', '')}"
+                score = self.enhancements.result_analyzer.score_result(
+                    '',  # No URL needed for element scoring
+                    element_text,
+                    goal
+                )
+                scored_elements.append((element, score))
+            
+            # Sort by score and return best match
+            scored_elements.sort(key=lambda x: x[1], reverse=True)
+            if scored_elements and scored_elements[0][1] > 0.3:
+                best_element = scored_elements[0][0]
+                return (
+                    f"#{best_element['id']}" if best_element.get('id')
+                    else f".{'.'.join(best_element['classes'])}" if best_element.get('classes')
+                    else None
+                )
+            
+            return None
+            
         except Exception as e:
-            logger.error(f"Error in find_best_element: {str(e)}")
+            logger.error(f"Error finding best element: {str(e)}")
             return None
 
     def _generate_selector(self, element_info: Dict[str, Any]) -> str:
@@ -982,69 +1069,183 @@ class BrowserTools:
 
     async def _plan_next_action(self, goal: str, page_state: Dict[str, Any]) -> Dict[str, Any]:
         """Plan next action using structured reasoning."""
-        prompt = {
-            "goal": goal,
-            "current_url": self.page.url().toString(),
-            "page_state": {
-                "title": page_state.get("title", ""),
-                "visible_elements": [
-                    {
-                        "type": elem.get("type"),
-                        "text": elem.get("text", ""),
-                        "role": elem.get("role", ""),
-                        "is_clickable": elem.get("tag") in ["a", "button"] or elem.get("role") in ["button", "link"]
-                    }
-                    for elem in page_state.get("interactive", [])
-                    if elem.get("visible")
-                ],
-                "navigation_elements": [
-                    {
-                        "text": elem.get("text", ""),
-                        "href": elem.get("href", "")
-                    }
-                    for elem in page_state.get("navigation", [])
-                    if elem.get("visible")
-                ]
-            },
-            "allowed_actions": [
-                {
-                    "type": "click",
-                    "description": "Click on a visible element"
-                },
-                {
-                    "type": "type",
-                    "description": "Enter text into an input field"
-                },
-                {
-                    "type": "scroll",
-                    "description": "Scroll the page in a direction"
-                }
-            ]
-        }
-
-        # Send as a single string without separate prompt parameter
-        prompt_text = f"""You are a web automation assistant.
-        Analyze the current page state and goal to determine the next best action.
-        Context: {json.dumps(prompt, indent=2)}
-        Return a JSON object with:
-        {{
-            "action": "click|type|scroll",
-            "target": "element text or selector",
-            "value": "text to type (for type action)",
-            "confidence": 0.0 to 1.0,
-            "reasoning": "explanation of why this action was chosen"
-        }}"""
-
-        response = await self.llm.generate_text(prompt_text)
-
         try:
-            plan = json.loads(response)
+            # For search tasks, first try to find the search input
+            if "search" in goal.lower():
+                search_element = await self._find_input_element(page_state)
+                if search_element:
+                    # Extract search query from goal
+                    search_terms = goal.split("search for")[-1].strip().strip("'\"")
+                    return {
+                        "action": "type",
+                        "target": search_element["selector"],
+                        "value": search_terms,
+                        "confidence": 1.0,
+                        "reasoning": f"Found search input element using selector: {search_element['selector']}"
+                    }
+            
+            # Fall back to general action planning
+            prompt = {
+                "goal": goal,
+                "current_url": self.page.url().toString(),
+                "page_state": {
+                    "title": page_state.get("title", ""),
+                    "visible_elements": [
+                        {
+                            "type": elem.get("type"),
+                            "text": elem.get("text", ""),
+                            "role": elem.get("role", ""),
+                            "is_clickable": elem.get("tag") in ["a", "button"] or elem.get("role") in ["button", "link"]
+                        }
+                        for elem in page_state.get("interactive", [])
+                        if elem.get("visible")
+                    ],
+                    "navigation_elements": [
+                        {
+                            "text": elem.get("text", ""),
+                            "href": elem.get("href", "")
+                        }
+                        for elem in page_state.get("navigation", [])
+                        if elem.get("visible")
+                    ]
+                }
+            }
+            
+            prompt_text = f"""You are a web automation assistant.
+            Analyze the current page state and goal to determine the next best action.
+            Context: {json.dumps(prompt, indent=2)}
+            Return a JSON object with:
+            {{
+                "action": "click|type|scroll",
+                "target": "element text or selector",
+                "value": "text to type (for type action)",
+                "confidence": 0.0 to 1.0,
+                "reasoning": "explanation of why this action was chosen"
+            }}
+            Important: Return ONLY the JSON object, no markdown formatting or comments."""
+            
+            response = await self.llm.generate_text(prompt_text)
+            if not response:
+                logger.error("No response from LLM")
+                return None
+                
+            # Clean and parse response
+            response = self._clean_llm_response(response)
+            
+            try:
+                plan = json.loads(response)
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse JSON response: {str(e)}")
+                logger.error(f"Raw response: {response}")
+                return None
+                
+            # Validate the plan structure
+            required_fields = ['action', 'target', 'confidence']
+            if not all(field in plan for field in required_fields):
+                logger.error(f"Missing required fields in plan: {required_fields}")
+                return None
+                
+            # Validate confidence threshold
             if plan.get("confidence", 0) > 0.7:
                 return plan
+            else:
+                logger.warning(f"Action plan confidence too low: {plan.get('confidence')}")
+                return None
+                
         except Exception as e:
-            logger.error(f"Error parsing action plan: {str(e)}")
+            logger.error(f"Error in action planning: {str(e)}")
+            return None
+            
+    def _clean_llm_response(self, response: str) -> str:
+        """Clean LLM response by removing markdown and comments."""
+        if not response:
+            return ""
+            
+        # Remove markdown code blocks
+        response = response.strip()
+        if response.startswith('```'):
+            response = response.split('```')[1]
+            if response.startswith('json'):
+                response = response[4:]
+        response = response.strip()
         
-        return None
+        # Remove comments
+        response_lines = []
+        in_multiline_comment = False
+        for line in response.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+                
+            # Handle multi-line comments
+            if '/*' in line:
+                in_multiline_comment = True
+                line = line[:line.index('/*')].strip()
+            if '*/' in line:
+                in_multiline_comment = False
+                line = line[line.index('*/') + 2:].strip()
+            if in_multiline_comment:
+                continue
+                
+            # Handle single-line comments
+            if '//' in line:
+                line = line[:line.index('//')].strip()
+            
+            if line:
+                response_lines.append(line)
+                
+        return ' '.join(response_lines)
+
+    async def _find_input_element(self, page_state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Find the main search input element using reliable selectors."""
+        try:
+            # Common Google search input selectors in order of preference
+            search_selectors = [
+                'textarea[name="q"]',  # Current Google search box
+                'input[name="q"]',     # Alternative search box
+                'input[type="text"]',  # Generic text input fallback
+                'textarea[type="search"]'  # Generic search textarea
+            ]
+            
+            script = """
+            function findSearchInput() {
+                const selectors = arguments[0];
+                for (const selector of selectors) {
+                    const element = document.querySelector(selector);
+                    if (element && element.offsetParent !== null) {  // Check visibility
+                        return {
+                            selector: selector,
+                            type: element.tagName.toLowerCase(),
+                            visible: true
+                        };
+                    }
+                }
+                return null;
+            }
+            findSearchInput(arguments[0]);
+            """
+            
+            # Create future for async result
+            loop = asyncio.get_event_loop()
+            future = loop.create_future()
+            
+            def handle_result(result):
+                future.set_result(result)
+                
+            self.page.runJavaScript(script, search_selectors, handle_result)
+            
+            try:
+                result = await asyncio.wait_for(future, timeout=5.0)
+                if result:
+                    return result
+            except asyncio.TimeoutError:
+                logger.warning("Search input detection timed out")
+                
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error finding input element: {str(e)}")
+            return None
 
     async def _track_action_history(self, action: Dict[str, Any]):
         """Track action history to prevent loops."""
@@ -1266,12 +1467,11 @@ class BrowserTools:
         })()
         """
         
-        result = await self._run_javascript(script)
-        if not result:
-            return {}
-            
-        # Process and enhance the results
         try:
+            result = await self._run_javascript(script)
+            if not result:
+                return {}
+                
             # Group elements by region
             viewport_height = result['viewport']['height']
             regions = {
@@ -1358,7 +1558,7 @@ class BrowserTools:
             # Process image with DETR
             inputs = self.processor(images=screenshot, return_tensors="pt")
             with torch.no_grad():  # Add no_grad for inference
-                outputs = self.model(**inputs)
+                outputs = self.vision_model(**inputs)
             
             # Get bounding boxes and scores
             probas = outputs.logits.softmax(-1)[0, :, :-1]
@@ -1620,4 +1820,157 @@ class BrowserTools:
                 
         except Exception as e:
             logger.error(f"Error executing action: {str(e)}")
-            return False 
+            return False
+
+    async def search_for_information(self, query: str, context: Dict = None) -> List[Dict]:
+        """Enhanced search functionality with optimized queries and result processing."""
+        try:
+            # Enhance query with context
+            enhanced_query = self.enhancements.enhance_search_query(query, context or {})
+            logger.info(f"Enhanced query: {enhanced_query}")
+            
+            # Perform search (implementation depends on your search provider)
+            raw_results = await self._perform_search(enhanced_query)
+            
+            # Process and analyze results
+            processed_results = await self.enhancements.process_search_results(
+                raw_results, enhanced_query
+            )
+            
+            # Calculate relevance scores
+            scores = self.enhancements.calculate_result_scores(raw_results, enhanced_query)
+            
+            # Combine results with scores
+            scored_results = []
+            for result, score in zip(raw_results, scores):
+                if score > 0.3:  # Filter low relevance results
+                    scored_results.append({
+                        **result,
+                        'relevance_score': score,
+                        'processed_info': processed_results.get('processed_results', [])
+                    })
+            
+            # Sort by relevance
+            scored_results.sort(key=lambda x: x['relevance_score'], reverse=True)
+            
+            return scored_results
+            
+        except Exception as e:
+            logger.error(f"Error in enhanced search: {str(e)}")
+            return []
+            
+    async def _perform_search(self, query: str) -> List[Dict]:
+        """Perform the actual search operation."""
+        # This is a placeholder - implement your actual search logic here
+        # For example, using Google Custom Search API, DuckDuckGo API, etc.
+        return []
+
+    def add_reasoning(self, title: str, description: str, details: List[str] = None):
+        """Add a reasoning entry to the UI."""
+        script = """
+        function addReasoning(title, description, details) {
+            const container = document.getElementById('agent-reasoning');
+            if (!container) {
+                const div = document.createElement('div');
+                div.id = 'agent-reasoning';
+                div.className = 'reasoning-log';
+                document.body.appendChild(div);
+                container = div;
+            }
+            
+            const entry = document.createElement('div');
+            entry.className = 'log-entry';
+            
+            const timestamp = document.createElement('div');
+            timestamp.className = 'timestamp';
+            timestamp.textContent = new Date().toLocaleTimeString();
+            
+            const titleDiv = document.createElement('div');
+            titleDiv.className = 'log-title';
+            titleDiv.textContent = title;
+            
+            const descDiv = document.createElement('div');
+            descDiv.className = 'log-details';
+            descDiv.textContent = description;
+            
+            entry.appendChild(timestamp);
+            entry.appendChild(titleDiv);
+            entry.appendChild(descDiv);
+            
+            if (details && details.length > 0) {
+                const detailsList = document.createElement('ul');
+                detailsList.style.margin = '5px 0';
+                detailsList.style.paddingLeft = '20px';
+                details.forEach(function(detail) {
+                    const li = document.createElement('li');
+                    li.textContent = detail;
+                    detailsList.appendChild(li);
+                });
+                entry.appendChild(detailsList);
+            }
+            
+            container.insertBefore(entry, container.firstChild);
+            
+            // Limit entries
+            while (container.children.length > 10) {
+                container.removeChild(container.lastChild);
+            }
+        }
+        addReasoning(arguments[0], arguments[1], arguments[2]);
+        """
+        self.page.runJavaScript(script, title, description, details or [])
+        
+    def add_execution(self, title: str, description: str, details: List[str] = None):
+        """Add an execution entry to the UI."""
+        script = """
+        function addExecution(title, description, details) {
+            const container = document.getElementById('execution-log');
+            if (!container) {
+                const div = document.createElement('div');
+                div.id = 'execution-log';
+                div.className = 'execution-log';
+                document.body.appendChild(div);
+                container = div;
+            }
+            
+            const entry = document.createElement('div');
+            entry.className = 'log-entry';
+            
+            const timestamp = document.createElement('div');
+            timestamp.className = 'timestamp';
+            timestamp.textContent = new Date().toLocaleTimeString();
+            
+            const titleDiv = document.createElement('div');
+            titleDiv.className = 'log-title';
+            titleDiv.textContent = title;
+            
+            const descDiv = document.createElement('div');
+            descDiv.className = 'log-details';
+            descDiv.textContent = description;
+            
+            entry.appendChild(timestamp);
+            entry.appendChild(titleDiv);
+            entry.appendChild(descDiv);
+            
+            if (details && details.length > 0) {
+                const detailsList = document.createElement('ul');
+                detailsList.style.margin = '5px 0';
+                detailsList.style.paddingLeft = '20px';
+                details.forEach(function(detail) {
+                    const li = document.createElement('li');
+                    li.textContent = detail;
+                    detailsList.appendChild(li);
+                });
+                entry.appendChild(detailsList);
+            }
+            
+            container.insertBefore(entry, container.firstChild);
+            
+            // Limit entries
+            while (container.children.length > 10) {
+                container.removeChild(container.lastChild);
+            }
+        }
+        addExecution(arguments[0], arguments[1], arguments[2]);
+        """
+        self.page.runJavaScript(script, title, description, details or [])

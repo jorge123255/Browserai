@@ -1,0 +1,206 @@
+# Migration Plan: GUI to Web UI
+
+## 1. Backend Architecture Changes
+
+### 1.1 FastAPI Backend Setup
+- Create new `web` directory
+- Set up FastAPI application structure:
+  ```
+  web/
+  ├── app/
+  │   ├── __init__.py
+  │   ├── main.py          # FastAPI app
+  │   ├── config.py        # Configuration
+  │   ├── dependencies.py  # Dependencies
+  │   └── api/
+  │       ├── __init__.py
+  │       ├── routes/
+  │       │   ├── browser.py  # Browser control endpoints
+  │       │   ├── tasks.py    # Task management
+  │       │   └── ws.py       # WebSocket handlers
+  │       └── models/
+  │           ├── browser.py  # Browser state models
+  │           └── tasks.py    # Task models
+  ```
+
+### 1.2 Core Service Layer
+- Create service abstractions:
+  ```python
+  services/
+  ├── browser_service.py    # Browser automation logic
+  ├── task_service.py       # Task execution
+  ├── recording_service.py  # Session recording
+  └── vision_service.py     # Vision model integration
+  ```
+
+### 1.3 WebSocket Integration
+- Implement real-time communication:
+  - Browser state updates
+  - Task progress
+  - Logs and reasoning
+  - Screenshots/recordings
+
+## 2. Frontend Development
+
+### 2.1 React Application Setup
+```
+frontend/
+├── src/
+│   ├── components/
+│   │   ├── BrowserView/
+│   │   ├── TaskPanel/
+│   │   ├── LogViewer/
+│   │   └── Controls/
+│   ├── services/
+│   │   ├── api.ts
+│   │   └── websocket.ts
+│   └── store/
+│       └── browser.ts
+```
+
+### 2.2 Key Components
+1. BrowserView
+   - Iframe for rendered page
+   - Overlay for visual feedback
+   - Screenshot preview
+
+2. TaskPanel
+   - Task input
+   - Execution controls
+   - Progress tracking
+
+3. LogViewer
+   - Real-time logs
+   - Reasoning display
+   - Action history
+
+4. Controls
+   - Navigation controls
+   - Recording controls
+   - Task management
+
+## 3. Browser Integration
+
+### 3.1 Headless Browser Service
+- Replace QWebEngine with Playwright/Puppeteer
+- Implement browser pool management
+- Add session isolation
+
+### 3.2 Screenshot and Recording
+- Implement browser screenshot capture
+- Add video recording capability
+- Real-time screen sharing
+
+### 3.3 Event Handling
+- Page load events
+- Navigation events
+- DOM mutations
+- Network requests
+
+## 4. Data Models
+
+### 4.1 Browser State
+```python
+class BrowserState(BaseModel):
+    url: str
+    title: str
+    is_loading: bool
+    screenshot_url: Optional[str]
+    current_task: Optional[Task]
+```
+
+### 4.2 Task Model
+```python
+class Task(BaseModel):
+    id: str
+    goal: str
+    status: TaskStatus
+    progress: float
+    actions: List[Action]
+```
+
+## 5. API Endpoints
+
+### 5.1 Browser Control
+```
+POST /api/browser/navigate
+POST /api/browser/execute
+GET /api/browser/screenshot
+WS /api/browser/events
+```
+
+### 5.2 Task Management
+```
+POST /api/tasks/create
+GET /api/tasks/{id}
+WS /api/tasks/{id}/progress
+```
+
+## 6. Implementation Phases
+
+### Phase 1: Core Backend
+1. Set up FastAPI project structure
+2. Implement browser service with Playwright
+3. Basic WebSocket communication
+4. Task execution service
+
+### Phase 2: Frontend Foundation
+1. Create React project
+2. Implement core components
+3. Basic styling and layout
+4. API integration
+
+### Phase 3: Advanced Features
+1. Real-time updates
+2. Visual feedback system
+3. Recording capabilities
+4. Enhanced logging
+
+### Phase 4: Polish & Optimization
+1. Error handling
+2. Performance optimization
+3. UI/UX improvements
+4. Documentation
+
+## 7. Technical Requirements
+
+### Backend
+- Python 3.9+
+- FastAPI
+- Playwright/Puppeteer
+- WebSocket support
+- Redis for state management
+
+### Frontend
+- React 18+
+- TypeScript
+- TailwindCSS
+- WebSocket client
+- State management (Zustand/Redux)
+
+## 8. Migration Strategy
+
+1. Create parallel web implementation
+2. Run both GUI and web versions
+3. Gradually shift features to web
+4. Phase out GUI components
+
+## 9. Testing Strategy
+
+1. Unit tests for services
+2. Integration tests for API
+3. E2E tests for web UI
+4. Performance testing
+
+## 10. Deployment
+
+### 10.1 Development
+- Docker compose setup
+- Hot reloading
+- Debug configuration
+
+### 10.2 Production
+- Containerization
+- Nginx configuration
+- SSL setup
+- Load balancing 

@@ -533,7 +533,7 @@ class BrowserAutomation(QObject):
         self.window = BrowserWindow()
         
         # Create browser tools with the browser's page
-        self.tools = BrowserTools(self.window.browser.page())
+        self.tools = BrowserTools(self.window.browser)
         
         # Setup logging
         logger.add(
